@@ -678,6 +678,11 @@ void ScaledDotProductAttentionVJP::eval_gpu(
     std::vector<array>& outputs) {
   nvtx3::scoped_range r("ScaledDotProductAttentionVJP::eval_gpu");
 
+  if (window_size_ > 0) {
+    throw std::runtime_error(
+        "[ScaledDotProductAttentionVJP] NYI: window attention on CUDA");
+  }
+
   auto& s = stream();
 
   assert(inputs.size() >= 6);

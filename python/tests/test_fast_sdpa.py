@@ -1548,6 +1548,45 @@ class TestFastSDPA(mlx_tests.MLXTestCase):
                     out = mx.where(valid, out, 0)
                 self.assertTrue(mx.allclose(ref, out, atol=1e-5, rtol=1e-5))
 
+    @unittest.skipIf(not mx.metal.is_available(), "Metal kernel path only")
+    def test_sdpa_window_grad(self):
+        D = 64
+        scale = D**-0.5
+        tolerance = {"rtol": 1e-2, "atol": 1e-2}
+
+        for (qL, kL), window, causal in product(
+            ((300, 300), (2500, 2500), (1000, 3000)),
+            (7, 128, 1000),
+            (False, True),
+        ):
+            with self.subTest(qL=qL, kL=kL, window=window, causal=causal):
+                q = mx.random.normal((1, 8, qL, D), dtype=mx.float16)
+                k = mx.random.normal((1, 2, kL, D), dtype=mx.float16)
+                v = mx.random.normal((1, 2, kL, D), dtype=mx.float16)
+                cotan = mx.random.normal((1, 8, qL, D), dtype=mx.float16)
+
+                ref_mask = make_window_mask(qL, kL, window)
+                if causal:
+                    ref_mask = ref_mask & make_causal_mask(qL, kL)
+
+                def slow(q, k, v):
+                    return mlx_ref_attn(q, k, v, scale=scale, mask=ref_mask)
+
+                def fast(q, k, v):
+                    return mx.fast.scaled_dot_product_attention(
+                        q,
+                        k,
+                        v,
+                        scale=scale,
+                        mask="causal" if causal else None,
+                        window_size=window,
+                    )
+
+                _, vjp1 = mx.vjp(slow, [q, k, v], [cotan])
+                _, vjp2 = mx.vjp(fast, [q, k, v], [cotan])
+                for g1, g2 in zip(vjp1, vjp2):
+                    self.assertTrue(mx.allclose(g1, g2, **tolerance))
+
     def test_sdpa_window_size_errors(self):
         q = mx.random.normal((1, 2, 4, 32))
         for window in (0, -2):

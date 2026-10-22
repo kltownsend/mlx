@@ -43,6 +43,7 @@ struct SDPAVJPTileParams {
   float scale;
   int diag_off;
   int causal;
+  int window;
 };
 
 template <typename T>
@@ -70,9 +71,12 @@ template <typename T>
   // Fully masked rows carry lse == -inf; exp(-inf - -inf) would be NaN.
   bool dead = (l < 0.0f) && metal::isinf(l);
   int lim = p.i0 + row + p.diag_off;
+  int dist = lim - (p.j0 + col);
+  bool masked = (p.causal != 0 && dist < 0) ||
+      (p.window > 0 && metal::abs(dist) >= p.window);
 
   float pv;
-  if (dead || (p.causal != 0 && (p.j0 + col) > lim)) {
+  if (dead || masked) {
     pv = 0.0f;
   } else {
     pv = metal::fast::exp(static_cast<float>(S[sbase + col]) * p.scale - l);

@@ -986,10 +986,6 @@ std::tuple<bool, std::string> has_fused_kernel(
         "the full attention kernel with a window requires the query sequence "
         "to be no longer than the key sequence."};
   }
-  if (output_logsumexp && window_size > 0) {
-    return {false, "window support for backward attention is NYI"};
-  }
-
   if (output_logsumexp && has_arr_mask) {
     return {
         false,
@@ -1109,6 +1105,7 @@ struct SDPAVJPTileParams {
   float scale;
   int diag_off;
   int causal;
+  int window;
 };
 
 array ensure_row_contiguous(const array& x, metal::Device& d, const Stream& s) {
@@ -1194,7 +1191,8 @@ void sdpa_vjp_blocked(
     array& dk,
     array& dv,
     float scale,
-    bool causal) {
+    bool causal,
+    int window_size) {
   auto& compute_encoder = metal::get_command_encoder(s);
 
   const int B = q.shape(0);
@@ -1262,6 +1260,18 @@ void sdpa_vjp_blocked(
   };
 
   const int n_i = (qL + BQ - 1) / BQ;
+  const bool has_window = window_size > 0;
+
+  // The window can leave whole key tiles unvisited, so zero dK and dV first.
+  if (has_window && diag_off > 0) {
+    array zero(0, ctype);
+    fill_gpu(zero, dk, s);
+    fill_gpu(zero, dv, s);
+    copies.push_back(std::move(zero));
+  }
+
+  // The first key tile a query tile visits sets dQ, later tiles add to it.
+  std::vector<bool> dq_set(n_i, false);
 
   const Strides q_bs = {
       H * int64_t(qL) * D, G * int64_t(qL) * D, int64_t(qL) * D};
@@ -1283,8 +1293,16 @@ void sdpa_vjp_blocked(
     for (int ii = 0; ii < n_i; ++ii) {
       const int i0 = ii * BQ;
       const int bq_len = std::min(BQ, qL - i0);
+      const int r_min = i0 + diag_off;
+      const int r_max = i0 + bq_len - 1 + diag_off;
+      const int j_max = j0 + bk_len - 1;
       // Skip tiles that lie entirely above the causal diagonal.
-      if (causal && j0 > i0 + bq_len - 1 + diag_off) {
+      if (causal && j0 > r_max) {
+        continue;
+      }
+      // Skip tiles that lie entirely outside the window.
+      if (has_window &&
+          (r_min - j_max >= window_size || j0 - r_max >= window_size)) {
         continue;
       }
 
@@ -1337,7 +1355,15 @@ void sdpa_vjp_blocked(
       array p_v = vjp_view(p_buf, {BH, bq_len, bk_len});
 
       SDPAVJPTileParams params{
-          bq_len, bk_len, qL, i0, j0, scale, diag_off, causal ? 1 : 0};
+          bq_len,
+          bk_len,
+          qL,
+          i0,
+          j0,
+          scale,
+          diag_off,
+          causal ? 1 : 0,
+          window_size};
 
       // P = exp(scale * S - lse), dS = P * (dP - delta) * scale
       compute_encoder.set_compute_pipeline_state(ds_kernel);
@@ -1418,7 +1444,8 @@ void sdpa_vjp_blocked(
           o_bs);
 
       // dQ[i0] += dQ_tile, dK[j0] += sum_G dK_tile, dV[j0] += sum_G dV_tile
-      run_reduce(dq_v, dq_acc, dq, bq_len, D, 1, qL, i0, BH, j0 != 0);
+      run_reduce(dq_v, dq_acc, dq, bq_len, D, 1, qL, i0, BH, dq_set[ii]);
+      dq_set[ii] = true;
       run_reduce(dk_v, dk_acc, dk, bk_len, D, G, kL, j0, BHk, kv_accum);
       run_reduce(dv_v, dv_acc, dv, bk_len, Dv, G, kL, j0, BHk, kv_accum);
 
@@ -1772,7 +1799,20 @@ void ScaledDotProductAttentionVJP::eval_gpu(
       MTL::Size(32, qL, B * H), MTL::Size(32, 1, 1));
 
   sdpa_vjp_blocked(
-      s, d, q, k, v, odo, lse, cot_o, dq, dk, dv, scale_, do_causal_);
+      s,
+      d,
+      q,
+      k,
+      v,
+      odo,
+      lse,
+      cot_o,
+      dq,
+      dk,
+      dv,
+      scale_,
+      do_causal_,
+      window_size_);
 }
 
 } // namespace mlx::core::fast
