@@ -1214,14 +1214,21 @@ void sdpa_vjp_blocked(
   Dtype ctype = q.dtype();
   std::string tname = get_type_string(ctype);
 
-  auto ds_kernel = d.get_kernel("sdpa_vjp_ds_" + tname);
+  // Keep S and dP in float32 so P = exp(S - lse) does not see bf16 rounding.
+  const bool f32_tiles =
+      ctype != float32 && env::get_var("MLX_SDPA_VJP_FP32_TILES", 0) != 0;
+  Dtype stype = f32_tiles ? float32 : ctype;
+
+  auto ds_kernel =
+      d.get_kernel("sdpa_vjp_ds_" + tname + (f32_tiles ? "_f32tiles" : ""));
   auto red_add = d.get_kernel("sdpa_vjp_reduce_add_" + tname);
   auto red_set = d.get_kernel("sdpa_vjp_reduce_set_" + tname);
 
   // Temporary tiles
-  array s_buf = vjp_alloc({BH, BQ, BK}, ctype, s);
-  array dp_buf = vjp_alloc({BH, BQ, BK}, ctype, s);
+  array s_buf = vjp_alloc({BH, BQ, BK}, stype, s);
+  array dp_buf = vjp_alloc({BH, BQ, BK}, stype, s);
   array p_buf = vjp_alloc({BH, BQ, BK}, ctype, s);
+  array ds_buf = f32_tiles ? vjp_alloc({BH, BQ, BK}, ctype, s) : s_buf;
 
   // Output of the gemms
   array dq_tile = vjp_alloc({BH, BQ, D}, ctype, s);
@@ -1282,11 +1289,28 @@ void sdpa_vjp_blocked(
   const Strides v_bs = {Hk * int64_t(kL) * Dv, int64_t(kL) * Dv, 0};
   const Shape bshape = {B, Hk, G};
 
+  // With float32 tiles, S and dP come from float32 copies of the inputs.
+  auto upcast = [&](const array& x) {
+    if (!f32_tiles) {
+      return x;
+    }
+    array y(x.shape(), float32, nullptr, {});
+    copy_gpu(x, y, CopyType::General, s);
+    copies.push_back(y);
+    return y;
+  };
+  array q_s = upcast(q);
+  array k_s = upcast(k);
+  array v_s = upcast(v);
+  array o_s = upcast(cot_o);
+
   for (int j0 = 0; j0 < kL; j0 += BK) {
     const int bk_len = std::min(BK, kL - j0);
 
     array k_sl = vjp_row_slice(k, j0, bk_len);
     array v_sl = vjp_row_slice(v, j0, bk_len);
+    array k_ssl = vjp_row_slice(k_s, j0, bk_len);
+    array v_ssl = vjp_row_slice(v_s, j0, bk_len);
 
     bool kv_accum = false;
 
@@ -1308,14 +1332,16 @@ void sdpa_vjp_blocked(
 
       array q_sl = vjp_row_slice(q, i0, bq_len);
       array o_sl = vjp_row_slice(cot_o, i0, bq_len);
+      array q_ssl = vjp_row_slice(q_s, i0, bq_len);
+      array o_ssl = vjp_row_slice(o_s, i0, bq_len);
 
       array s_v = vjp_view(s_buf, {BH, bq_len, bk_len});
       // S = Q @ K.T
       steel_matmul(
           s,
           d,
-          q_sl,
-          k_sl,
+          q_ssl,
+          k_ssl,
           s_v,
           bq_len,
           bk_len,
@@ -1335,8 +1361,8 @@ void sdpa_vjp_blocked(
       steel_matmul(
           s,
           d,
-          o_sl,
-          v_sl,
+          o_ssl,
+          v_ssl,
           dp_v,
           bq_len,
           bk_len,
@@ -1351,7 +1377,7 @@ void sdpa_vjp_blocked(
           o_bs,
           v_bs);
 
-      array ds_v = vjp_view(s_buf, {BH, bq_len, bk_len});
+      array ds_v = vjp_view(ds_buf, {BH, bq_len, bk_len});
       array p_v = vjp_view(p_buf, {BH, bq_len, bk_len});
 
       SDPAVJPTileParams params{
@@ -1371,7 +1397,7 @@ void sdpa_vjp_blocked(
       compute_encoder.set_input_array(dp_v, 1);
       compute_encoder.set_input_array(lse, 2);
       compute_encoder.set_input_array(odo, 3);
-      compute_encoder.set_output_array(s_v, 4);
+      compute_encoder.set_output_array(ds_v, 4);
       compute_encoder.set_output_array(p_v, 5);
       compute_encoder.set_bytes(params, 6);
       compute_encoder.dispatch_threads(

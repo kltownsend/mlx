@@ -46,10 +46,10 @@ struct SDPAVJPTileParams {
   int window;
 };
 
-template <typename T>
+template <typename T, typename ST>
 [[kernel]] void sdpa_vjp_ds(
-    const device T* S [[buffer(0)]], // [BH, bq, bk]
-    const device T* dP [[buffer(1)]], // [BH, bq, bk]
+    const device ST* S [[buffer(0)]], // [BH, bq, bk]
+    const device ST* dP [[buffer(1)]], // [BH, bq, bk]
     const device float* lse [[buffer(2)]], // [B, H, qL]
     const device float* odo [[buffer(3)]], // [B, H, qL]
     device T* dS [[buffer(4)]], // [BH, bq, bk]
@@ -141,11 +141,15 @@ instantiate_odo_shapes(float16_t);
 instantiate_odo_shapes(float);
 
 #define instantiate_sdpa_vjp_ds(tname, type) \
-  instantiate_kernel("sdpa_vjp_ds_" #tname, sdpa_vjp_ds, type)
+  instantiate_kernel("sdpa_vjp_ds_" #tname, sdpa_vjp_ds, type, type)
+#define instantiate_sdpa_vjp_ds_f32tiles(tname, type) \
+  instantiate_kernel("sdpa_vjp_ds_" #tname "_f32tiles", sdpa_vjp_ds, type, float)
 
 instantiate_sdpa_vjp_ds(float, float);
 instantiate_sdpa_vjp_ds(float16_t, float16_t);
 instantiate_sdpa_vjp_ds(bfloat16_t, bfloat16_t);
+instantiate_sdpa_vjp_ds_f32tiles(float16_t, float16_t);
+instantiate_sdpa_vjp_ds_f32tiles(bfloat16_t, bfloat16_t);
 
 #define instantiate_sdpa_vjp_reduce(tname, type)                 \
   instantiate_kernel(                                            \
