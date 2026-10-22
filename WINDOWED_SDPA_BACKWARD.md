@@ -36,4 +36,4 @@ The full method and numbers will be written up as a lab on labs.layer2c.com.
 
 ---
 
-Disclosure: the code, tests and this README were generated with Claude (Anthropic) working in my lab, and I reviewed them.
+Disclosure: I wrote the code, the tests and this README using Claude Code, Anthropic's coding agent.
